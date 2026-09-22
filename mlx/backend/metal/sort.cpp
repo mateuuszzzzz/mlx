@@ -317,6 +317,67 @@ void gpu_merge_sort(
   }
 }
 
+// Radix select beats merge sort from these sizes on (measured on M3 Pro).
+// Rows up to 128 elements sort inside one simdgroup, small inputs are bound
+// by the dispatch, and one threadgroup per row leaves the GPU idle with
+// fewer rows.
+constexpr int RADIX_PARTITION_MIN_AXIS_SIZE = 129;
+constexpr size_t RADIX_PARTITION_MIN_SIZE = 48 * 1024;
+constexpr int RADIX_PARTITION_MIN_ROWS = 4;
+
+bool use_radix_partition(const array& in, int axis) {
+  if (axis != in.ndim() - 1 || !in.flags().row_contiguous) {
+    return false;
+  }
+  if (in.dtype() == bool_ || in.dtype() == complex64) {
+    return false;
+  }
+  int axis_size = in.shape(axis);
+  if (axis_size < RADIX_PARTITION_MIN_AXIS_SIZE ||
+      in.size() < RADIX_PARTITION_MIN_SIZE) {
+    return false;
+  }
+  int n_rows = in.size() / axis_size;
+  return n_rows >= RADIX_PARTITION_MIN_ROWS;
+}
+
+void gpu_radix_partition(
+    const Stream& s,
+    metal::Device& d,
+    const array& in,
+    array& out,
+    int axis,
+    int kth,
+    bool arg_partition) {
+  int axis_size = in.shape(axis);
+  int n_rows = in.size() / axis_size;
+
+  // Threads per row, so each thread gets a few elements per pass
+  int bn = 256;
+  if (axis_size < 1024) {
+    bn = 64;
+  } else if (axis_size < 4096) {
+    bn = 128;
+  }
+
+  std::string kernel_name =
+      arg_partition ? "radix_argpartition_" : "radix_partition_";
+  concatenate(kernel_name, type_to_name(in), "_bn", bn);
+  auto kernel =
+      get_partition_kernel(d, kernel_name, in, out, arg_partition, bn);
+
+  auto& compute_encoder = metal::get_command_encoder(s);
+  compute_encoder.set_compute_pipeline_state(kernel);
+  compute_encoder.set_input_array(in, 0);
+  compute_encoder.set_output_array(out, 1);
+  compute_encoder.set_bytes(axis_size, 2);
+  compute_encoder.set_bytes(kth, 3);
+
+  MTL::Size group_dims = MTL::Size(bn, 1, 1);
+  MTL::Size grid_dims = MTL::Size(1, n_rows, 1);
+  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+}
+
 } // namespace
 
 void ArgSort::eval_gpu(const std::vector<array>& inputs, array& out) {
@@ -344,7 +405,6 @@ void Sort::eval_gpu(const std::vector<array>& inputs, array& out) {
 }
 
 void ArgPartition::eval_gpu(const std::vector<array>& inputs, array& out) {
-  // We direct arg partition to sort for now
   assert(inputs.size() == 1);
 
   out.set_data(allocator::malloc(out.nbytes()));
@@ -353,11 +413,14 @@ void ArgPartition::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto& d = metal::device(s.device);
   auto& in = inputs[0];
 
-  gpu_merge_sort(s, d, in, out, axis_, true);
+  if (use_radix_partition(in, axis_)) {
+    gpu_radix_partition(s, d, in, out, axis_, kth_, true);
+  } else {
+    gpu_merge_sort(s, d, in, out, axis_, true);
+  }
 }
 
 void Partition::eval_gpu(const std::vector<array>& inputs, array& out) {
-  // We direct partition to sort for now
   assert(inputs.size() == 1);
 
   out.set_data(allocator::malloc(out.nbytes()));
@@ -366,7 +429,11 @@ void Partition::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto& d = metal::device(s.device);
   auto& in = inputs[0];
 
-  gpu_merge_sort(s, d, in, out, axis_, false);
+  if (use_radix_partition(in, axis_)) {
+    gpu_radix_partition(s, d, in, out, axis_, kth_, false);
+  } else {
+    gpu_merge_sort(s, d, in, out, axis_, false);
+  }
 }
 
 void SearchSorted::eval_gpu(const std::vector<array>& inputs, array& out) {
