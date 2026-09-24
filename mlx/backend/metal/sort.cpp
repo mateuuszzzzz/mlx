@@ -5,6 +5,7 @@
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/kernels.h"
+#include "mlx/backend/metal/kernels/defines.h"
 #include "mlx/backend/metal/utils.h"
 #include "mlx/primitives.h"
 
@@ -317,13 +318,23 @@ void gpu_merge_sort(
   }
 }
 
-// Radix select beats merge sort from these sizes on (measured on M3 Pro).
-// Rows up to 128 elements sort inside one simdgroup, small inputs are bound
-// by the dispatch, and one threadgroup per row leaves the GPU idle with
-// fewer rows.
+// Radix select beats merge sort from this row length on, rows up to 128
+// elements sort inside one simdgroup (measured on M3 Pro).
 constexpr int RADIX_PARTITION_MIN_AXIS_SIZE = 129;
-constexpr size_t RADIX_PARTITION_MIN_SIZE = 48 * 1024;
-constexpr int RADIX_PARTITION_MIN_ROWS = 4;
+
+// One simdgroup per row beats both while the row fits in 16 elements per
+// lane and the rounds times the elements per lane stay small, each round
+// scans the lane and removes one element (measured on M3 Pro).
+constexpr int SIMD_PARTITION_MAX_AXIS_SIZE = 512;
+constexpr int SIMD_PARTITION_MAX_LANE_WORK = 96;
+
+// A few very long rows get several threadgroups per row, one histogram
+// dispatch per digit plus the write (measured on M3 Pro).
+constexpr int SPLIT_PARTITION_MIN_AXIS_SIZE = 32768;
+constexpr int SPLIT_PARTITION_MAX_ROWS = 8;
+constexpr int SPLIT_PARTITION_MAX_GROUPS = 32;
+constexpr int SPLIT_PARTITION_TARGET_GROUPS = 64;
+constexpr int SPLIT_PARTITION_ELEMENTS_PER_GROUP = 4096;
 
 bool use_radix_partition(const array& in, int axis) {
   if (axis != in.ndim() - 1 || !in.flags().row_contiguous) {
@@ -332,13 +343,149 @@ bool use_radix_partition(const array& in, int axis) {
   if (in.dtype() == bool_ || in.dtype() == complex64) {
     return false;
   }
-  int axis_size = in.shape(axis);
-  if (axis_size < RADIX_PARTITION_MIN_AXIS_SIZE ||
-      in.size() < RADIX_PARTITION_MIN_SIZE) {
+  return in.shape(axis) >= RADIX_PARTITION_MIN_AXIS_SIZE;
+}
+
+// Elements per lane of the simdgroup kernel, the smallest instantiated size
+// that covers the row
+int simd_partition_n_per(int axis_size) {
+  constexpr int simd_size = 32;
+  int n_per = 4;
+  while (n_per * simd_size < axis_size) {
+    n_per *= 2;
+  }
+  return n_per;
+}
+
+bool use_simd_partition(const array& in, int axis, int kth) {
+  if (axis != in.ndim() - 1 || !in.flags().row_contiguous) {
     return false;
   }
+  if (in.dtype() == bool_ || in.dtype() == complex64 ||
+      size_of(in.dtype()) > 4) {
+    return false;
+  }
+  int axis_size = in.shape(axis);
+  int rounds = std::min(kth + 1, axis_size - kth);
+  return axis_size <= SIMD_PARTITION_MAX_AXIS_SIZE &&
+      rounds * simd_partition_n_per(axis_size) <= SIMD_PARTITION_MAX_LANE_WORK;
+}
+
+bool use_split_partition(const array& in, int axis) {
+  if (axis != in.ndim() - 1 || !in.flags().row_contiguous) {
+    return false;
+  }
+  if (in.dtype() == bool_ || in.dtype() == complex64) {
+    return false;
+  }
+  int axis_size = in.shape(axis);
   int n_rows = in.size() / axis_size;
-  return n_rows >= RADIX_PARTITION_MIN_ROWS;
+  return axis_size >= SPLIT_PARTITION_MIN_AXIS_SIZE &&
+      n_rows <= SPLIT_PARTITION_MAX_ROWS;
+}
+
+void gpu_split_partition(
+    const Stream& s,
+    metal::Device& d,
+    const array& in,
+    array& out,
+    int axis,
+    int kth,
+    bool arg_partition) {
+  int axis_size = in.shape(axis);
+  int n_rows = in.size() / axis_size;
+  constexpr int digit_bits = RADIX_PARTITION_WIDE_DIGIT_BITS;
+  int key_bits = 8 * size_of(in.dtype());
+  int n_passes = (key_bits + digit_bits - 1) / digit_bits;
+  // Groups per row, enough groups in total without making the chunks tiny
+  int groups = std::min(
+      {SPLIT_PARTITION_MAX_GROUPS,
+       std::max(1, SPLIT_PARTITION_TARGET_GROUPS / n_rows),
+       (axis_size + SPLIT_PARTITION_ELEMENTS_PER_GROUP - 1) /
+           SPLIT_PARTITION_ELEMENTS_PER_GROUP});
+
+  // Histogram history of every row and the record of every group
+  array hist({n_rows, n_passes, 1 << digit_bits}, uint32, nullptr, {});
+  array records(
+      {n_rows, groups, SPLIT_PARTITION_RECORD_SIZE}, uint32, nullptr, {});
+  hist.set_data(allocator::malloc(hist.nbytes()));
+  records.set_data(allocator::malloc(records.nbytes()));
+  array zero = array(0, uint32);
+  fill_gpu(zero, hist, s);
+
+  auto& compute_encoder = metal::get_command_encoder(s);
+  compute_encoder.add_temporary(std::move(zero));
+  compute_encoder.add_temporary(hist);
+  compute_encoder.add_temporary(records);
+
+  MTL::Size group_dims = MTL::Size(SPLIT_PARTITION_THREADS, 1, 1);
+  MTL::Size grid_dims = MTL::Size(groups, n_rows, 1);
+
+  std::string hist_name = "split_partition_histogram_";
+  concatenate(hist_name, type_to_name(in));
+  auto hist_kernel = get_split_partition_histogram_kernel(d, hist_name, in);
+  for (int pass = 0; pass < n_passes; pass++) {
+    compute_encoder.set_compute_pipeline_state(hist_kernel);
+    compute_encoder.set_input_array(in, 0);
+    compute_encoder.set_input_array(hist, 1);
+    compute_encoder.set_output_array(hist, 1);
+    compute_encoder.set_output_array(records, 2);
+    compute_encoder.set_bytes(axis_size, 3);
+    compute_encoder.set_bytes(kth, 4);
+    compute_encoder.set_bytes(pass, 5);
+    compute_encoder.set_bytes(n_passes, 6);
+    compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+  }
+
+  std::string kernel_name =
+      arg_partition ? "split_argpartition_" : "split_partition_";
+  concatenate(kernel_name, type_to_name(in));
+  auto kernel =
+      get_split_partition_kernel(d, kernel_name, in, out, arg_partition);
+  compute_encoder.set_compute_pipeline_state(kernel);
+  compute_encoder.set_input_array(in, 0);
+  compute_encoder.set_output_array(out, 1);
+  compute_encoder.set_input_array(hist, 2);
+  compute_encoder.set_input_array(records, 3);
+  compute_encoder.set_bytes(axis_size, 4);
+  compute_encoder.set_bytes(kth, 5);
+  compute_encoder.set_bytes(n_passes, 6);
+  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+}
+
+void gpu_simd_partition(
+    const Stream& s,
+    metal::Device& d,
+    const array& in,
+    array& out,
+    int axis,
+    int kth,
+    bool arg_partition) {
+  int axis_size = in.shape(axis);
+  int n_rows = in.size() / axis_size;
+
+  constexpr int simd_size = 32;
+  int n_per = simd_partition_n_per(axis_size);
+  std::string kernel_name =
+      arg_partition ? "simd_argpartition_" : "simd_partition_";
+  concatenate(kernel_name, type_to_name(in), "_n", n_per);
+  auto kernel =
+      get_simd_partition_kernel(d, kernel_name, in, out, arg_partition, n_per);
+
+  auto& compute_encoder = metal::get_command_encoder(s);
+  compute_encoder.set_compute_pipeline_state(kernel);
+  compute_encoder.set_input_array(in, 0);
+  compute_encoder.set_output_array(out, 1);
+  compute_encoder.set_bytes(axis_size, 2);
+  compute_encoder.set_bytes(kth, 3);
+  compute_encoder.set_bytes(n_rows, 4);
+
+  int n_groups = (n_rows + SIMD_PARTITION_ROWS_PER_GROUP - 1) /
+      SIMD_PARTITION_ROWS_PER_GROUP;
+  MTL::Size group_dims =
+      MTL::Size(SIMD_PARTITION_ROWS_PER_GROUP * simd_size, 1, 1);
+  MTL::Size grid_dims = MTL::Size(1, n_groups, 1);
+  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
 
 void gpu_radix_partition(
@@ -413,7 +560,11 @@ void ArgPartition::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto& d = metal::device(s.device);
   auto& in = inputs[0];
 
-  if (use_radix_partition(in, axis_)) {
+  if (use_simd_partition(in, axis_, kth_)) {
+    gpu_simd_partition(s, d, in, out, axis_, kth_, true);
+  } else if (use_split_partition(in, axis_)) {
+    gpu_split_partition(s, d, in, out, axis_, kth_, true);
+  } else if (use_radix_partition(in, axis_)) {
     gpu_radix_partition(s, d, in, out, axis_, kth_, true);
   } else {
     gpu_merge_sort(s, d, in, out, axis_, true);
@@ -429,7 +580,11 @@ void Partition::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto& d = metal::device(s.device);
   auto& in = inputs[0];
 
-  if (use_radix_partition(in, axis_)) {
+  if (use_simd_partition(in, axis_, kth_)) {
+    gpu_simd_partition(s, d, in, out, axis_, kth_, false);
+  } else if (use_split_partition(in, axis_)) {
+    gpu_split_partition(s, d, in, out, axis_, kth_, false);
+  } else if (use_radix_partition(in, axis_)) {
     gpu_radix_partition(s, d, in, out, axis_, kth_, false);
   } else {
     gpu_merge_sort(s, d, in, out, axis_, false);

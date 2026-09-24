@@ -458,6 +458,62 @@ MTL::ComputePipelineState* get_partition_kernel(
   return d.get_kernel(kernel_name, lib);
 }
 
+MTL::ComputePipelineState* get_simd_partition_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const array& in,
+    const array& out,
+    bool arg_partition,
+    int n_per) {
+  auto lib = d.get_library(kernel_name, [&]() {
+    std::ostringstream kernel_source;
+    kernel_source << metal::utils() << metal::partition();
+    kernel_source << get_template_definition(
+        kernel_name,
+        "simd_partition",
+        get_type_string(in.dtype()),
+        get_type_string(out.dtype()),
+        arg_partition ? "true" : "false",
+        n_per);
+    return kernel_source.str();
+  });
+  return d.get_kernel(kernel_name, lib);
+}
+
+MTL::ComputePipelineState* get_split_partition_histogram_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const array& in) {
+  auto lib = d.get_library(kernel_name, [&]() {
+    std::ostringstream kernel_source;
+    kernel_source << metal::utils() << metal::partition();
+    kernel_source << get_template_definition(
+        kernel_name, "split_partition_histogram", get_type_string(in.dtype()));
+    return kernel_source.str();
+  });
+  return d.get_kernel(kernel_name, lib);
+}
+
+MTL::ComputePipelineState* get_split_partition_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const array& in,
+    const array& out,
+    bool arg_partition) {
+  auto lib = d.get_library(kernel_name, [&]() {
+    std::ostringstream kernel_source;
+    kernel_source << metal::utils() << metal::partition();
+    kernel_source << get_template_definition(
+        kernel_name,
+        "split_partition",
+        get_type_string(in.dtype()),
+        get_type_string(out.dtype()),
+        arg_partition ? "true" : "false");
+    return kernel_source.str();
+  });
+  return d.get_kernel(kernel_name, lib);
+}
+
 MTL::ComputePipelineState* get_searchsorted_kernel(
     metal::Device& d,
     const std::string& kernel_name,

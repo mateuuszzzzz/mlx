@@ -3007,6 +3007,98 @@ class TestOps(mlx_tests.MLXTestCase):
                             M = top_k_mx.shape[axis or 0]
                             self.assertEqual(M, (kth + N) % N)
 
+    def test_partition_long_rows(self):
+        # Rows long enough for the Metal radix select path
+        np.random.seed(0)
+
+        def check(a_np, a_mx, kth):
+            # a_np is the float32 reference of a_mx when a_mx is bfloat16
+            n = a_np.shape[-1]
+            b_mx = mx.partition(a_mx, kth, axis=-1)
+            self.assertEqual(b_mx.dtype, a_mx.dtype)
+            b_np = np.array(
+                b_mx.astype(mx.float32) if a_mx.dtype == mx.bfloat16 else b_mx
+            )
+            self.assertTrue(
+                np.array_equal(
+                    np.sort(b_np, axis=-1), np.sort(a_np, axis=-1), equal_nan=True
+                )
+            )
+            pivot = np.partition(a_np, kth, axis=-1)[:, kth : kth + 1]
+            self.assertTrue(
+                np.array_equal(b_np[:, kth : kth + 1], pivot, equal_nan=True)
+            )
+            finite = np.where(np.isnan(b_np), np.inf, b_np)
+            self.assertTrue(np.all(finite[:, :kth] <= finite[:, kth : kth + 1]))
+            self.assertTrue(np.all(finite[:, kth + 1 :] >= finite[:, kth : kth + 1]))
+
+            i_mx = mx.argpartition(a_mx, kth, axis=-1)
+            i_np = np.array(i_mx)
+            self.assertEqual(i_mx.dtype, mx.uint32)
+            self.assertTrue(
+                np.array_equal(
+                    np.sort(i_np, axis=-1), np.tile(np.arange(n), (a_np.shape[0], 1))
+                )
+            )
+            g_np = np.take_along_axis(a_np, i_np, axis=-1)
+            self.assertTrue(
+                np.array_equal(g_np[:, kth : kth + 1], pivot, equal_nan=True)
+            )
+            finite = np.where(np.isnan(g_np), np.inf, g_np)
+            self.assertTrue(np.all(finite[:, :kth] <= finite[:, kth : kth + 1]))
+            self.assertTrue(np.all(finite[:, kth + 1 :] >= finite[:, kth : kth + 1]))
+
+        shape = (64, 4096)
+        for dtype in ("float32", "float16", "int8", "int32", "int64", "uint16"):
+            for kth in (0, 1, 32, 2048, 4063, 4095):
+                with self.subTest(dtype=dtype, kth=kth):
+                    a_np = np.random.uniform(-100, 100, size=shape).astype(dtype)
+                    check(a_np, mx.array(a_np), kth)
+
+        # Row lengths that pick the smaller threadgroups
+        for short_shape in ((32, 512), (48, 1000), (32, 2048)):
+            n = short_shape[1]
+            for kth in (0, 7, n // 2, n - 1):
+                with self.subTest(shape=short_shape, kth=kth):
+                    a_np = np.random.uniform(-100, 100, size=short_shape).astype(
+                        np.float32
+                    )
+                    check(a_np, mx.array(a_np), kth)
+
+        # bfloat16 goes through float32 for the reference
+        a_np = np.random.uniform(-100, 100, size=shape).astype(np.float32)
+        a_np[:, ::97] = np.nan
+        a_mx = mx.array(a_np).astype(mx.bfloat16)
+        a_np = np.array(a_mx.astype(mx.float32))
+        for kth in (0, 32, 4095):
+            with self.subTest(dtype="bfloat16", kth=kth):
+                check(a_np, a_mx, kth)
+
+        # Ties and NaN
+        a_np = np.random.randint(0, 5, size=shape).astype(np.float32)
+        a_np[:, ::7] = np.nan
+        for kth in (0, 2048, 4095):
+            with self.subTest(dtype="nan", kth=kth):
+                check(a_np, mx.array(a_np), kth)
+
+        # Longer rows than the candidate cache, 16-bit and 32-bit keys
+        for dtype in ("float16", "float32"):
+            a_np = np.random.uniform(-100, 100, size=(32, 40000)).astype(dtype)
+            with self.subTest(dtype=dtype, kth=40000 - 2048):
+                check(a_np, mx.array(a_np), 40000 - 2048)
+
+        # Other axes and views take the sort path
+        a_np = np.random.uniform(-100, 100, size=(4096, 64)).astype(np.float32)
+        b_np = np.partition(a_np, 3, axis=0)
+        b_mx = np.array(mx.partition(mx.array(a_np), 3, axis=0))
+        self.assertTrue(np.array_equal(np.sort(b_mx, axis=0), np.sort(a_np, axis=0)))
+        self.assertTrue(np.array_equal(b_mx[3], b_np[3]))
+        a_t = mx.array(a_np).T
+        b_t = np.array(mx.partition(a_t, 3, axis=-1))
+        self.assertTrue(
+            np.array_equal(b_t[:, 3], np.partition(a_np.T, 3, axis=-1)[:, 3])
+        )
+
     def test_argpartition(self):
         x = mx.broadcast_to(mx.array([1, 2, 3]), (2, 3))
         out = mx.argpartition(x, kth=1, axis=0)

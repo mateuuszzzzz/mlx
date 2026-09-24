@@ -110,6 +110,32 @@ MTL::ComputePipelineState* get_partition_kernel(
   return d.get_kernel(kernel_name);
 }
 
+MTL::ComputePipelineState* get_simd_partition_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const array&,
+    const array&,
+    bool,
+    int) {
+  return d.get_kernel(kernel_name);
+}
+
+MTL::ComputePipelineState* get_split_partition_histogram_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const array&) {
+  return d.get_kernel(kernel_name);
+}
+
+MTL::ComputePipelineState* get_split_partition_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const array&,
+    const array&,
+    bool) {
+  return d.get_kernel(kernel_name);
+}
+
 MTL::ComputePipelineState* get_searchsorted_kernel(
     metal::Device& d,
     const std::string& kernel_name,
